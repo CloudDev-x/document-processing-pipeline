@@ -43,11 +43,12 @@ def claim(document_id):
         table.update_item(
             Key={"document_id": document_id},
             UpdateExpression="SET #s = :processing, updated_at = :now ADD attempts :one",
-            ConditionExpression="attribute_not_exists(document_id) OR #s <> :completed",
+            ConditionExpression="attribute_not_exists(document_id) OR (#s <> :completed AND #s <> :failed)",
             ExpressionAttributeNames={"#s": "status"},
             ExpressionAttributeValues={
                 ":processing": "PROCESSING",
                 ":completed": "COMPLETED",
+                ":failed": "FAILED",
                 ":now": now_iso(),
                 ":one": 1,
             },
