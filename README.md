@@ -63,10 +63,10 @@ To be completed as the project is built. Will cover inspecting failed messages, 
 
 ## Progress
 
-- [ ] Upload path (S3 presigned URL, S3 event to SQS)
-- [ ] Processing worker (Lambda)
-- [ ] Model call with timeout and validation
-- [ ] DynamoDB status tracking
-- [ ] DLQ and alarms
-- [ ] Terraform
-- [ ] Load test
+- [x] Upload path (S3 presigned URL, S3 event to SQS)
+- [x] Processing worker (Lambda)
+- [x] Model call with timeout and validation
+- [x] DynamoDB status tracking
+- [x] DLQ and alarms
+- [x] Terraform
+- [x] Load test
