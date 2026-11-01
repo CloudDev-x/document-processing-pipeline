@@ -1,3 +1,8 @@
+locals {
+  # Inference profile routes within US regions only, which keeps customer documents in the US.
+  model_id = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+}
+
 data "archive_file" "worker" {
   type        = "zip"
   source_file = "${path.module}/../src/handler.py"
@@ -25,7 +30,7 @@ resource "aws_iam_role_policy_attachment" "worker_logs" {
   policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
 }
 
-# Least privilege: only the queue actions and the one table the worker uses.
+# Least privilege: only the actions and resources the worker uses.
 data "aws_iam_policy_document" "worker" {
   statement {
     actions   = ["sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:GetQueueAttributes"]
@@ -34,6 +39,18 @@ data "aws_iam_policy_document" "worker" {
   statement {
     actions   = ["dynamodb:UpdateItem"]
     resources = [aws_dynamodb_table.documents.arn]
+  }
+  statement {
+    actions   = ["s3:GetObject"]
+    resources = ["${aws_s3_bucket.uploads.arn}/*"]
+  }
+  # The inference profile, plus the foundation model in the US regions it can route to.
+  statement {
+    actions = ["bedrock:InvokeModel"]
+    resources = [
+      "arn:aws:bedrock:us-east-1:${data.aws_caller_identity.current.account_id}:inference-profile/${local.model_id}",
+      "arn:aws:bedrock:us-*::foundation-model/anthropic.claude-haiku-4-5-20251001-v1:0",
+    ]
   }
 }
 
@@ -55,7 +72,9 @@ resource "aws_lambda_function" "worker" {
 
   environment {
     variables = {
-      TABLE_NAME = aws_dynamodb_table.documents.name
+      TABLE_NAME  = aws_dynamodb_table.documents.name
+      BUCKET_NAME = aws_s3_bucket.uploads.id
+      MODEL_ID    = local.model_id
     }
   }
 }
