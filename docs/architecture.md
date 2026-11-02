@@ -3,6 +3,7 @@
 ```mermaid
 flowchart LR
   Client["Client (per-tenant API key)"] -->|"POST /documents"| APIGW["API Gateway"]
+  Client -->|"POST /documents/{id}/review"| APIGW
   APIGW --> API["docpipe-api Lambda"]
   API -->|"presigned POST to tenant/uuid"| Client
   Client -->|"upload"| S3["S3 uploads bucket (versioned)"]
@@ -25,13 +26,18 @@ flowchart LR
   ExtractTextract --> Bedrock
   Extract --> Validate["Validate and route"]
   ExtractTextract --> Validate
-  Validate --> Persist["Persist"]
+  Validate -->|"REVIEW or COMPLETED"| Persist["Persist"]
   Persist --> DDB
   SFN -.->|"any error"| MarkFailed["Mark FAILED"]
   MarkFailed --> DDB
+  SSM["SSM /docpipe settings"] -.-> SFN
   DDB -->|"stream"| StreamFn["docpipe-stream Lambda"]
   StreamFn -->|"one row per status change"| Audit[("DynamoDB docpipe-audit")]
   StreamFn -->|"terminal status"| Events["SNS docpipe-document-events"]
+  Events --> WebhookQ["SQS docpipe-webhooks"]
+  WebhookQ --> WebhookFn["docpipe-webhook Lambda"]
+  WebhookQ -.->|"5 failed receives"| WebhookDLQ["SQS webhooks DLQ"]
+  WebhookFn -->|"signed HTTPS POST"| Tenant["Tenant webhook URL"]
   CW["CloudWatch alarms"] -.-> Queue
   CW -.-> DLQ
   CW -.-> SFN

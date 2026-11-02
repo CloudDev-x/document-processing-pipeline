@@ -94,4 +94,22 @@ Pushing to `main` runs CI: unit tests, Terraform format and validate, then `terr
 
 - Every terminal status (`COMPLETED`, `REVIEW`, `FAILED`) is published to the `docpipe-document-events` SNS topic. Messages carry `tenant_id` and `status` as attributes, so subscribers can filter.
 - Delivery is at least once. Subscribers should dedupe on `document_id` and `status`.
-- Webhooks per tenant are planned for the next phase.
+
+## Webhooks (Phase 4)
+
+- Each terminal status is also delivered as a signed HTTP POST to the tenant's webhook URL, if one is configured.
+- Delivery path: SNS topic, then an SQS queue, then the `docpipe-webhook` Lambda. Failed deliveries retry through SQS, and after five attempts they go to `docpipe-webhooks-dlq`.
+- Each tenant's URL and signing secret live in SSM under `/docpipe/tenants/<tenant>/`. Terraform creates them as `disabled` and ignores later changes, so set real values with `aws ssm put-parameter --overwrite`.
+- Requests carry `X-DocPipe-Event-Id`, `X-DocPipe-Timestamp`, and `X-DocPipe-Signature`. The signature is `sha256=` followed by HMAC-SHA256 of `"<timestamp>.<body>"` using the tenant's secret. Receivers should check the signature and reject old timestamps.
+- Only HTTPS URLs are used.
+
+## Human review (Phase 4)
+
+- `POST /documents/{id}/review` with `{"decision": "approve" | "reject", "corrections": {...}}`.
+- Only documents in `REVIEW` can be reviewed. The update is conditional, so a second reviewer gets a 409.
+- Approve sets `COMPLETED`, and reject sets `FAILED`. Corrections are stored on the document. The original extraction is left unchanged, so consumers merge the two.
+
+## Settings in SSM (Phase 4)
+
+- The model ID, review threshold, and extraction prompt live in `/docpipe/model_id`, `/docpipe/review_threshold`, and `/docpipe/extraction_prompt`.
+- The steps Lambda reads them once per container, so changes apply to containers that start after the update.
