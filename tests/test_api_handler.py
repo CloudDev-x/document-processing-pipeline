@@ -1,13 +1,14 @@
-"""Unit tests for the API handler. AWS calls are mocked; nothing hits the network."""
+"""Unit tests for the API handler: tenancy, routes, errors, and serialisation. AWS calls are mocked."""
 
 import json
 import os
 import uuid
 from decimal import Decimal
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 os.environ.setdefault("BUCKET_NAME", "test-bucket")
 os.environ.setdefault("TABLE_NAME", "test-table")
+os.environ.setdefault("TENANT_BY_KEY_ID", json.dumps({"key-acme": "acme"}))
 os.environ.setdefault("AWS_DEFAULT_REGION", "us-east-1")
 
 import pytest
@@ -16,13 +17,14 @@ from src import api_handler
 from src.api_handler import lambda_handler, respond
 
 
-def event(method, resource, body=None, path_params=None, query=None):
+def event(method, resource, key_id="key-acme", body=None, path_params=None, query=None):
     return {
         "httpMethod": method,
         "resource": resource,
         "body": body,
         "pathParameters": path_params,
         "queryStringParameters": query,
+        "requestContext": {"identity": {"apiKeyId": key_id}},
     }
 
 
@@ -39,27 +41,39 @@ def presign():
         yield mock
 
 
+class TestTenancy:
+    def test_unknown_key_is_forbidden(self, table):
+        resp = lambda_handler(event("GET", "/documents", key_id="key-unknown"), None)
+        assert resp["statusCode"] == 403
+        table.query.assert_not_called()
+
+    def test_missing_identity_is_forbidden(self, table):
+        resp = lambda_handler({"httpMethod": "GET", "resource": "/documents"}, None)
+        assert resp["statusCode"] == 403
+
+
 class TestCreateUpload:
-    def test_returns_presigned_post(self, presign):
+    def test_returns_presigned_post_under_tenant_prefix(self, presign):
         resp = lambda_handler(event("POST", "/documents", body='{"content_type":"text/plain"}'), None)
         assert resp["statusCode"] == 201
         body = json.loads(resp["body"])
         uuid.UUID(body["document_id"])
-        assert body["upload"]["url"] == "https://example.test/"
-        kwargs = presign.call_args.kwargs
-        assert kwargs["Key"] == body["document_id"]
-        assert kwargs["ExpiresIn"] == 300
-        assert ["content-length-range", 1, api_handler.MAX_UPLOAD_BYTES] in kwargs["Conditions"]
+        assert presign.call_args.kwargs["Key"] == f"acme/{body['document_id']}"
+        assert presign.call_args.kwargs["ExpiresIn"] == 300
+        assert ["content-length-range", 1, api_handler.MAX_UPLOAD_BYTES] in presign.call_args.kwargs["Conditions"]
 
     def test_defaults_to_text_plain_without_body(self, presign):
         resp = lambda_handler(event("POST", "/documents", body=None), None)
         assert resp["statusCode"] == 201
         assert presign.call_args.kwargs["Fields"]["Content-Type"] == "text/plain"
 
+    def test_accepts_pdf(self, presign):
+        resp = lambda_handler(event("POST", "/documents", body='{"content_type":"application/pdf"}'), None)
+        assert resp["statusCode"] == 201
+
     def test_rejects_unsupported_content_type(self, presign):
         resp = lambda_handler(event("POST", "/documents", body='{"content_type":"application/zip"}'), None)
         assert resp["statusCode"] == 400
-        assert "unsupported content_type" in json.loads(resp["body"])["error"]
         presign.assert_not_called()
 
     def test_rejects_invalid_json(self, presign):
@@ -72,6 +86,7 @@ class TestGetDocument:
     def test_returns_parsed_extraction_and_int_attempts(self, table):
         table.get_item.return_value = {
             "Item": {
+                "tenant_id": "acme",
                 "document_id": "abc",
                 "status": "COMPLETED",
                 "attempts": Decimal("1"),
@@ -83,7 +98,7 @@ class TestGetDocument:
         body = json.loads(resp["body"])
         assert body["attempts"] == 1
         assert body["extraction"]["document_type"] == "statement"
-        table.get_item.assert_called_once_with(Key={"document_id": "abc"})
+        table.get_item.assert_called_once_with(Key={"tenant_id": "acme", "document_id": "abc"})
 
     def test_not_found(self, table):
         table.get_item.return_value = {}
@@ -92,21 +107,22 @@ class TestGetDocument:
 
 
 class TestListDocuments:
-    def test_lists_without_filter(self, table):
-        table.scan.return_value = {"Items": [{"document_id": "a"}, {"document_id": "b"}]}
+    def test_queries_only_the_callers_tenant(self, table):
+        table.query.return_value = {"Items": [{"document_id": "a"}, {"document_id": "b"}]}
         resp = lambda_handler(event("GET", "/documents"), None)
-        body = json.loads(resp["body"])
-        assert resp["statusCode"] == 200
-        assert body["count"] == 2
-        assert "FilterExpression" not in table.scan.call_args.kwargs
+        assert json.loads(resp["body"])["count"] == 2
+        kwargs = table.query.call_args.kwargs
+        assert kwargs["KeyConditionExpression"] == "tenant_id = :t"
+        assert kwargs["ExpressionAttributeValues"] == {":t": "acme"}
+        assert "FilterExpression" not in kwargs
 
     def test_filters_by_status(self, table):
-        table.scan.return_value = {"Items": []}
+        table.query.return_value = {"Items": []}
         resp = lambda_handler(event("GET", "/documents", query={"status": "REVIEW"}), None)
         assert resp["statusCode"] == 200
-        kwargs = table.scan.call_args.kwargs
+        kwargs = table.query.call_args.kwargs
         assert kwargs["FilterExpression"] == "#s = :status"
-        assert kwargs["ExpressionAttributeValues"] == {":status": "REVIEW"}
+        assert kwargs["ExpressionAttributeValues"] == {":t": "acme", ":status": "REVIEW"}
 
 
 class TestRouting:

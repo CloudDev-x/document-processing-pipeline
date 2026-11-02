@@ -37,7 +37,7 @@ TRANSIENT_BEDROCK_ERRORS = {
     "InternalServerException",
 }
 TEXTRACT_TERMINAL_STATUSES = {"SUCCEEDED", "FAILED", "PARTIAL_SUCCESS"}
-# Textract JobTag rules: letters, digits and a few symbols, up to 64 characters.
+# Textract JobTag rules: letters, digits and a few symbols, up to 64 characters. The tag is tenant:document_id.
 JOB_TAG_PATTERN = re.compile(r"^[A-Za-z0-9_.\-:+=@]{1,64}$")
 
 EXTRACTION_PROMPT = """You classify and extract data from a customer document.
@@ -58,6 +58,14 @@ class TerminalError(ValueError):
 
 def now_iso():
     return datetime.now(timezone.utc).isoformat()
+
+
+def s3_key(tenant_id, document_id):
+    return f"{tenant_id}/{document_id}"
+
+
+def document_key(event):
+    return {"tenant_id": event["tenant_id"], "document_id": event["document_id"]}
 
 
 def read_text(bucket, key):
@@ -122,9 +130,9 @@ def validate_result(result):
     return result
 
 
-def finalize(document_id, status, result, usage):
+def finalize(key, status, result, usage):
     table.update_item(
-        Key={"document_id": document_id},
+        Key=key,
         UpdateExpression=(
             "SET #s = :status, extraction = :e, model_id = :m, "
             "input_tokens = :i, output_tokens = :o, updated_at = :now"
@@ -141,9 +149,9 @@ def finalize(document_id, status, result, usage):
     )
 
 
-def record_failure(document_id, message):
+def record_failure(key, message):
     table.update_item(
-        Key={"document_id": document_id},
+        Key=key,
         UpdateExpression="SET #s = :failed, last_error = :err, updated_at = :now",
         ExpressionAttributeNames={"#s": "status"},
         ExpressionAttributeValues={":failed": "FAILED", ":err": message[:500], ":now": now_iso()},
@@ -191,80 +199,6 @@ def wait_for_text(job_id, timeout_seconds=300, poll_seconds=5):
         time.sleep(poll_seconds)
 
 
-def action_classify(event):
-    head = s3.head_object(Bucket=BUCKET_NAME, Key=event["document_id"])
-    content_type = head.get("ContentType", "").split(";")[0].strip().lower()
-    if content_type in TEXT_CONTENT_TYPES:
-        route = "text"
-    elif content_type in TEXTRACT_CONTENT_TYPES:
-        route = "textract"
-    else:
-        raise TerminalError(f"unsupported content type: {content_type or 'none'}")
-    return {"route": route, "content_type": content_type}
-
-
-def action_start_textract(event):
-    document_id = event["document_id"]
-    if not JOB_TAG_PATTERN.match(document_id):
-        raise TerminalError("document id cannot be used as a Textract job tag")
-    # Save the task token before starting the job. If the job finished first, the callback would find no token to resume.
-    table.update_item(
-        Key={"document_id": document_id},
-        UpdateExpression="SET task_token = :t, updated_at = :now",
-        ExpressionAttributeValues={":t": event["task_token"], ":now": now_iso()},
-    )
-    job_id = start_text_detection(
-        BUCKET_NAME,
-        document_id,
-        job_tag=document_id,
-        topic_arn=TEXTRACT_TOPIC_ARN,
-        role_arn=TEXTRACT_ROLE_ARN,
-    )
-    table.update_item(
-        Key={"document_id": document_id},
-        UpdateExpression="SET textract_job_id = :j",
-        ExpressionAttributeValues={":j": job_id},
-    )
-    return {"job_id": job_id}
-
-
-def action_read_textract(event):
-    document_id = event["document_id"]
-    item = table.get_item(Key={"document_id": document_id}).get("Item") or {}
-    job_id = item.get("textract_job_id")
-    if not job_id:
-        raise TerminalError("no Textract job recorded for this document")
-    status, text = get_text_detection(job_id)
-    if status not in TEXTRACT_TERMINAL_STATUSES:
-        raise TransientError(f"Textract job still {status}")
-    if status != "SUCCEEDED":
-        raise TerminalError(f"Textract finished with status {status}")
-    if not text or not text.strip():
-        raise TerminalError("Textract found no text in the document")
-    text_key = f"text/{document_id}.txt"
-    s3.put_object(Bucket=SCRATCH_BUCKET_NAME, Key=text_key, Body=text.encode("utf-8"))
-    return {"text_key": text_key}
-
-
-def action_extract(event):
-    if event.get("text_key"):
-        text = read_text(SCRATCH_BUCKET_NAME, event["text_key"])
-    else:
-        text = read_text(BUCKET_NAME, event["document_id"])
-    return call_model(text)
-
-
-def action_validate(event):
-    result = validate_result(parse_model_json(event["raw_reply"]))
-    status = "REVIEW" if result["confidence"] < REVIEW_THRESHOLD else "COMPLETED"
-    return {"status": status, "result": result}
-
-
-def action_persist(event):
-    finalize(event["document_id"], event["status"], event["result"], event["usage"])
-    return {"status": event["status"]}
-
-
 def describe_error(raw):
     """Step Functions passes the caught error as a JSON string. Pull out the readable message."""
     try:
@@ -279,8 +213,83 @@ def describe_error(raw):
         return str(raw)
 
 
+def action_classify(event):
+    head = s3.head_object(Bucket=BUCKET_NAME, Key=s3_key(event["tenant_id"], event["document_id"]))
+    content_type = head.get("ContentType", "").split(";")[0].strip().lower()
+    if content_type in TEXT_CONTENT_TYPES:
+        route = "text"
+    elif content_type in TEXTRACT_CONTENT_TYPES:
+        route = "textract"
+    else:
+        raise TerminalError(f"unsupported content type: {content_type or 'none'}")
+    return {"route": route, "content_type": content_type}
+
+
+def action_start_textract(event):
+    key = document_key(event)
+    job_tag = f"{key['tenant_id']}:{key['document_id']}"
+    if not JOB_TAG_PATTERN.match(job_tag):
+        raise TerminalError("document id cannot be used as a Textract job tag")
+    # Save the task token before starting the job. If the job finished first, the callback would find no token to resume.
+    table.update_item(
+        Key=key,
+        UpdateExpression="SET task_token = :t, updated_at = :now",
+        ExpressionAttributeValues={":t": event["task_token"], ":now": now_iso()},
+    )
+    job_id = start_text_detection(
+        BUCKET_NAME,
+        s3_key(key["tenant_id"], key["document_id"]),
+        job_tag=job_tag,
+        topic_arn=TEXTRACT_TOPIC_ARN,
+        role_arn=TEXTRACT_ROLE_ARN,
+    )
+    table.update_item(
+        Key=key,
+        UpdateExpression="SET textract_job_id = :j",
+        ExpressionAttributeValues={":j": job_id},
+    )
+    return {"job_id": job_id}
+
+
+def action_read_textract(event):
+    key = document_key(event)
+    item = table.get_item(Key=key).get("Item") or {}
+    job_id = item.get("textract_job_id")
+    if not job_id:
+        raise TerminalError("no Textract job recorded for this document")
+    status, text = get_text_detection(job_id)
+    if status not in TEXTRACT_TERMINAL_STATUSES:
+        raise TransientError(f"Textract job still {status}")
+    if status != "SUCCEEDED":
+        raise TerminalError(f"Textract finished with status {status}")
+    if not text or not text.strip():
+        raise TerminalError("Textract found no text in the document")
+    text_key = f"text/{key['tenant_id']}/{key['document_id']}.txt"
+    s3.put_object(Bucket=SCRATCH_BUCKET_NAME, Key=text_key, Body=text.encode("utf-8"))
+    return {"text_key": text_key}
+
+
+def action_extract(event):
+    if event.get("text_key"):
+        text = read_text(SCRATCH_BUCKET_NAME, event["text_key"])
+    else:
+        text = read_text(BUCKET_NAME, s3_key(event["tenant_id"], event["document_id"]))
+    return call_model(text)
+
+
+def action_validate(event):
+    result = validate_result(parse_model_json(event["raw_reply"]))
+    status = "REVIEW" if result["confidence"] < REVIEW_THRESHOLD else "COMPLETED"
+    return {"status": status, "result": result}
+
+
+def action_persist(event):
+    finalize(document_key(event), event["status"], event["result"], event["usage"])
+    return {"status": event["status"]}
+
+
 def action_fail(event):
-    record_failure(event["document_id"], describe_error(event.get("error", "unknown error")))
+    record_failure(document_key(event), describe_error(event.get("error", "unknown error")))
     return {"status": "FAILED"}
 
 

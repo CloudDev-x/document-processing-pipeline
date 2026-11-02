@@ -30,16 +30,17 @@ def sns_event(message):
 
 
 def pending(token="tok-1"):
-    return {"Item": {"document_id": "doc-1", "task_token": token}}
+    return {"Item": {"tenant_id": "acme", "document_id": "doc-1", "task_token": token}}
 
 
-SUCCEEDED = {"JobId": "job-1", "Status": "SUCCEEDED", "JobTag": "doc-1"}
+SUCCEEDED = {"JobId": "job-1", "Status": "SUCCEEDED", "JobTag": "acme:doc-1"}
 
 
 def test_succeeded_resumes_workflow(table, sfn):
     table.get_item.return_value = pending()
     result = textract_callback.lambda_handler(sns_event(SUCCEEDED), None)
     assert result == {"results": ["resumed"]}
+    table.get_item.assert_called_once_with(Key={"tenant_id": "acme", "document_id": "doc-1"})
     kwargs = sfn.send_task_success.call_args.kwargs
     assert kwargs["taskToken"] == "tok-1"
     assert json.loads(kwargs["output"]) == {"document_id": "doc-1", "textract_job_id": "job-1"}
@@ -55,23 +56,29 @@ def test_claim_is_conditional_on_the_token(table, sfn):
 
 def test_failed_status_fails_workflow(table, sfn):
     table.get_item.return_value = pending()
-    message = {"JobId": "job-1", "Status": "FAILED", "JobTag": "doc-1"}
+    message = {"JobId": "job-1", "Status": "FAILED", "JobTag": "acme:doc-1"}
     result = textract_callback.lambda_handler(sns_event(message), None)
     assert result == {"results": ["failed"]}
     assert sfn.send_task_failure.call_args.kwargs["taskToken"] == "tok-1"
     sfn.send_task_success.assert_not_called()
 
 
-def test_missing_job_tag_is_ignored(table, sfn):
-    message = {"JobId": "job-1", "Status": "SUCCEEDED"}
+def test_untenanted_job_tag_is_ignored(table, sfn):
+    message = {"JobId": "job-1", "Status": "SUCCEEDED", "JobTag": "doc-1"}
     result = textract_callback.lambda_handler(sns_event(message), None)
-    assert result == {"results": ["ignored: no JobTag"]}
+    assert result == {"results": ["ignored: no tenant-scoped JobTag"]}
     table.get_item.assert_not_called()
     sfn.send_task_success.assert_not_called()
 
 
+def test_missing_job_tag_is_ignored(table, sfn):
+    message = {"JobId": "job-1", "Status": "SUCCEEDED"}
+    result = textract_callback.lambda_handler(sns_event(message), None)
+    assert result == {"results": ["ignored: no tenant-scoped JobTag"]}
+
+
 def test_no_pending_task_is_ignored(table, sfn):
-    table.get_item.return_value = {"Item": {"document_id": "doc-1"}}
+    table.get_item.return_value = {"Item": {"tenant_id": "acme", "document_id": "doc-1"}}
     result = textract_callback.lambda_handler(sns_event(SUCCEEDED), None)
     assert result == {"results": ["ignored: no pending task"]}
     table.update_item.assert_not_called()

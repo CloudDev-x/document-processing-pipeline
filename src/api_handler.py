@@ -7,6 +7,7 @@ import boto3
 
 BUCKET_NAME = os.environ["BUCKET_NAME"]
 TABLE_NAME = os.environ["TABLE_NAME"]
+TENANT_BY_KEY_ID = json.loads(os.environ["TENANT_BY_KEY_ID"])
 UPLOAD_TTL_SECONDS = 300
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 ALLOWED_CONTENT_TYPES = {"text/plain", "application/pdf", "image/png", "image/jpeg"}
@@ -29,7 +30,12 @@ def respond(status, body):
     }
 
 
-def create_upload(event):
+def tenant_for(event):
+    identity = (event.get("requestContext") or {}).get("identity") or {}
+    return TENANT_BY_KEY_ID.get(identity.get("apiKeyId"))
+
+
+def create_upload(tenant_id, event):
     try:
         payload = json.loads(event.get("body") or "{}")
     except json.JSONDecodeError:
@@ -42,7 +48,7 @@ def create_upload(event):
     document_id = str(uuid.uuid4())
     upload = s3.generate_presigned_post(
         Bucket=BUCKET_NAME,
-        Key=document_id,
+        Key=f"{tenant_id}/{document_id}",
         Fields={"Content-Type": content_type},
         Conditions=[
             {"Content-Type": content_type},
@@ -53,8 +59,8 @@ def create_upload(event):
     return respond(201, {"document_id": document_id, "upload": upload, "expires_in": UPLOAD_TTL_SECONDS})
 
 
-def get_document(document_id):
-    item = table.get_item(Key={"document_id": document_id}).get("Item")
+def get_document(tenant_id, document_id):
+    item = table.get_item(Key={"tenant_id": tenant_id, "document_id": document_id}).get("Item")
     if item is None:
         return respond(404, {"error": "not found"})
     if isinstance(item.get("extraction"), str):
@@ -62,27 +68,33 @@ def get_document(document_id):
     return respond(200, item)
 
 
-def list_documents(event):
+def list_documents(tenant_id, event):
     status = (event.get("queryStringParameters") or {}).get("status")
-    scan_args = {
-        "ProjectionExpression": "document_id, #s, updated_at, attempts",
+    query_args = {
+        "KeyConditionExpression": "tenant_id = :t",
         "ExpressionAttributeNames": {"#s": "status"},
+        "ExpressionAttributeValues": {":t": tenant_id},
+        "ProjectionExpression": "document_id, #s, updated_at, attempts",
     }
     if status:
-        scan_args["FilterExpression"] = "#s = :status"
-        scan_args["ExpressionAttributeValues"] = {":status": status}
-    items = table.scan(**scan_args).get("Items", [])
+        query_args["FilterExpression"] = "#s = :status"
+        query_args["ExpressionAttributeValues"][":status"] = status
+    items = table.query(**query_args).get("Items", [])
     return respond(200, {"documents": items, "count": len(items)})
 
 
 def lambda_handler(event, context):
+    tenant_id = tenant_for(event)
+    if tenant_id is None:
+        return respond(403, {"error": "forbidden"})
+
     route = event.get("resource")
     method = event.get("httpMethod")
 
     if route == "/documents" and method == "POST":
-        return create_upload(event)
+        return create_upload(tenant_id, event)
     if route == "/documents" and method == "GET":
-        return list_documents(event)
+        return list_documents(tenant_id, event)
     if route == "/documents/{id}" and method == "GET":
-        return get_document(event["pathParameters"]["id"])
+        return get_document(tenant_id, event["pathParameters"]["id"])
     return respond(405, {"error": "method not allowed"})

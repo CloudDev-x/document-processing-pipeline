@@ -1,4 +1,4 @@
-"""Unit tests for the starter Lambda that claims documents and starts workflows. AWS calls are mocked."""
+"""Unit tests for the starter Lambda: tenant keys, claiming, and starting workflows. AWS calls are mocked."""
 
 import json
 import os
@@ -35,24 +35,37 @@ def claim():
         yield mock
 
 
-def test_execution_name_is_sanitised():
-    assert starter.execution_name("a b/c.txt", 1) == "a_b_c_txt-1"
+def test_split_key_reads_tenant_prefix():
+    assert starter.split_key("acme/doc-1") == ("acme", "doc-1")
 
 
-def test_execution_name_is_at_most_80_chars():
-    assert len(starter.execution_name("x" * 200, 1)) <= 80
+def test_split_key_rejects_keys_without_tenant():
+    assert starter.split_key("loose.txt") is None
+    assert starter.split_key("/doc-1") is None
+
+
+def test_execution_name_is_sanitised_and_short():
+    assert starter.execution_name("acme", "doc-1", 1) == "acme-doc-1-1"
+    assert len(starter.execution_name("x" * 100, "y" * 200, 1)) <= 80
 
 
 def test_starts_one_workflow_per_document(sfn, claim):
-    starter.lambda_handler(s3_event("doc-1"), None)
+    starter.lambda_handler(s3_event("acme/doc-1"), None)
+    claim.assert_called_once_with("acme", "doc-1")
     kwargs = sfn.start_execution.call_args.kwargs
-    assert kwargs["name"] == "doc-1-1"
-    assert json.loads(kwargs["input"]) == {"document_id": "doc-1"}
+    assert kwargs["name"] == "acme-doc-1-1"
+    assert json.loads(kwargs["input"]) == {"tenant_id": "acme", "document_id": "doc-1"}
+
+
+def test_untenanted_object_is_ignored(sfn, claim):
+    starter.lambda_handler(s3_event("loose.txt"), None)
+    claim.assert_not_called()
+    sfn.start_execution.assert_not_called()
 
 
 def test_duplicate_claim_starts_nothing(sfn, claim):
     claim.return_value = False
-    starter.lambda_handler(s3_event("doc-1"), None)
+    starter.lambda_handler(s3_event("acme/doc-1"), None)
     sfn.start_execution.assert_not_called()
 
 
@@ -60,11 +73,15 @@ def test_already_started_is_not_an_error(sfn, claim):
     sfn.start_execution.side_effect = ClientError(
         {"Error": {"Code": "ExecutionAlreadyExists", "Message": "x"}}, "StartExecution"
     )
-    starter.lambda_handler(s3_event("doc-1"), None)
+    starter.lambda_handler(s3_event("acme/doc-1"), None)
 
 
 def test_test_event_is_ignored(sfn, claim):
-    event = {"Records": [{"attributes": {"ApproximateReceiveCount": "1"}, "body": json.dumps({"Event": "s3:TestEvent"})}]}
+    event = {
+        "Records": [
+            {"attributes": {"ApproximateReceiveCount": "1"}, "body": json.dumps({"Event": "s3:TestEvent"})}
+        ]
+    }
     starter.lambda_handler(event, None)
     claim.assert_not_called()
     sfn.start_execution.assert_not_called()

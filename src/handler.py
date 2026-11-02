@@ -20,11 +20,21 @@ def now_iso():
     return datetime.now(timezone.utc).isoformat()
 
 
-def claim(document_id):
+def split_key(key):
+    """Uploads are stored as tenant/document_id. Returns (tenant, document_id), or None for anything else."""
+    if "/" not in key:
+        return None
+    tenant_id, document_id = key.split("/", 1)
+    if not tenant_id or not document_id:
+        return None
+    return tenant_id, document_id
+
+
+def claim(tenant_id, document_id):
     """Mark a document PROCESSING unless it is already COMPLETED or FAILED. Returns False for duplicates."""
     try:
         table.update_item(
-            Key={"document_id": document_id},
+            Key={"tenant_id": tenant_id, "document_id": document_id},
             UpdateExpression="SET #s = :processing, updated_at = :now ADD attempts :one",
             ConditionExpression="attribute_not_exists(document_id) OR (#s <> :completed AND #s <> :failed)",
             ExpressionAttributeNames={"#s": "status"},
@@ -43,23 +53,23 @@ def claim(document_id):
         raise
 
 
-def execution_name(document_id, receive_count):
+def execution_name(tenant_id, document_id, receive_count):
     # Execution names allow letters, digits, hyphens and underscores, up to 80 characters.
     # The same S3 event (same receive count) maps to the same name, so Step Functions rejects duplicates.
-    safe = re.sub(r"[^A-Za-z0-9_-]", "_", document_id)
+    safe = re.sub(r"[^A-Za-z0-9_-]", "_", f"{tenant_id}-{document_id}")
     return f"{safe}-{receive_count}"[:80]
 
 
-def start_workflow(document_id, receive_count):
+def start_workflow(tenant_id, document_id, receive_count):
     try:
         sfn.start_execution(
             stateMachineArn=STATE_MACHINE_ARN,
-            name=execution_name(document_id, receive_count),
-            input=json.dumps({"document_id": document_id}),
+            name=execution_name(tenant_id, document_id, receive_count),
+            input=json.dumps({"tenant_id": tenant_id, "document_id": document_id}),
         )
     except ClientError as err:
         if err.response["Error"]["Code"] == "ExecutionAlreadyExists":
-            logger.info("Workflow already started for %s", document_id)
+            logger.info("Workflow already started for %s/%s", tenant_id, document_id)
             return
         raise
 
@@ -74,7 +84,12 @@ def lambda_handler(event, context):
         for s3_record in body["Records"]:
             # S3 URL-encodes object keys in events (spaces become "+"), so decode them.
             key = unquote_plus(s3_record["s3"]["object"]["key"])
-            if not claim(key):
+            parts = split_key(key)
+            if parts is None:
+                logger.warning("Ignoring object outside a tenant prefix: %s", key)
+                continue
+            tenant_id, document_id = parts
+            if not claim(tenant_id, document_id):
                 logger.info("Duplicate delivery, already completed or failed: %s", key)
                 continue
-            start_workflow(key, receive_count)
+            start_workflow(tenant_id, document_id, receive_count)

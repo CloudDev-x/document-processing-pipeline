@@ -4,6 +4,11 @@ data "archive_file" "api" {
   output_path = "${path.module}/build/api.zip"
 }
 
+# Tenants. Each gets its own API key, so usage plans throttle and cap each tenant separately.
+locals {
+  tenants = toset(["acme", "globex"])
+}
+
 resource "aws_iam_role" "api" {
   name               = "docpipe-api"
   assume_role_policy = data.aws_iam_policy_document.lambda_assume.json
@@ -17,6 +22,7 @@ resource "aws_iam_role_policy_attachment" "api_logs" {
 resource "aws_iam_role_policy" "api" {
   name = "docpipe-api"
   role = aws_iam_role.api.id
+
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
@@ -27,7 +33,7 @@ resource "aws_iam_role_policy" "api" {
       },
       {
         Effect   = "Allow"
-        Action   = ["dynamodb:GetItem", "dynamodb:Scan"]
+        Action   = ["dynamodb:GetItem", "dynamodb:Query"]
         Resource = aws_dynamodb_table.documents.arn
       },
     ]
@@ -46,8 +52,9 @@ resource "aws_lambda_function" "api" {
 
   environment {
     variables = {
-      BUCKET_NAME = aws_s3_bucket.uploads.bucket
-      TABLE_NAME  = aws_dynamodb_table.documents.name
+      BUCKET_NAME      = aws_s3_bucket.uploads.bucket
+      TABLE_NAME       = aws_dynamodb_table.documents.name
+      TENANT_BY_KEY_ID = jsonencode({ for t, k in aws_api_gateway_api_key.tenant : k.id => t })
     }
   }
 }
@@ -175,13 +182,15 @@ resource "aws_api_gateway_usage_plan" "default" {
   }
 }
 
-resource "aws_api_gateway_api_key" "client" {
-  name    = "docpipe-client-1"
-  enabled = true
+resource "aws_api_gateway_api_key" "tenant" {
+  for_each = local.tenants
+  name     = "docpipe-${each.key}"
+  enabled  = true
 }
 
-resource "aws_api_gateway_usage_plan_key" "client" {
-  key_id        = aws_api_gateway_api_key.client.id
+resource "aws_api_gateway_usage_plan_key" "tenant" {
+  for_each      = local.tenants
+  key_id        = aws_api_gateway_api_key.tenant[each.key].id
   key_type      = "API_KEY"
   usage_plan_id = aws_api_gateway_usage_plan.default.id
 }

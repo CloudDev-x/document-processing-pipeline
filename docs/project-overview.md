@@ -52,7 +52,6 @@ See [architecture.md](architecture.md) for the diagram.
 
 ## Known limitations
 
-- The list endpoint scans the table. A global secondary index on status would replace it.
 - The deploy role has `AdministratorAccess`. A scoped policy is the next step.
 - API keys, not Cognito, authenticate clients.
 - Multi-page PDFs with partial OCR success are rejected rather than sent to review.
@@ -79,3 +78,20 @@ Manual end-to-end results:
 ## Deployment
 
 Pushing to `main` runs CI: unit tests, Terraform format and validate, then `terraform apply` through an OIDC role. The Terraform state lives in S3 with locking.
+
+## Multi-tenancy (Phase 4)
+
+- Each tenant has its own API key, mapped to a tenant ID by the API. The tenant list lives in `infra/api.tf` (`locals.tenants`).
+- Documents are keyed by `(tenant_id, document_id)` in DynamoDB. Uploads are stored under `tenant/<uuid>` in S3.
+- Listing queries by tenant, so one tenant can never list another's documents.
+
+## Audit trail (Phase 4)
+
+- The uploads bucket has versioning enabled, so overwritten and deleted uploads can be recovered.
+- A DynamoDB stream writes one row per status change to `docpipe-audit`, keyed by `tenant#document` and timestamp.
+
+## Notifications (Phase 4)
+
+- Every terminal status (`COMPLETED`, `REVIEW`, `FAILED`) is published to the `docpipe-document-events` SNS topic. Messages carry `tenant_id` and `status` as attributes, so subscribers can filter.
+- Delivery is at least once. Subscribers should dedupe on `document_id` and `status`.
+- Webhooks per tenant are planned for the next phase.

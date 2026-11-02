@@ -11,21 +11,23 @@ sfn = boto3.client("stepfunctions")
 def handle_message(message):
     job_id = message.get("JobId")
     status = message.get("Status")
-    document_id = message.get("JobTag")
-    if not document_id:
-        return "ignored: no JobTag"
+    # The job tag is tenant_id:document_id, set when the workflow started the job.
+    job_tag = message.get("JobTag") or ""
+    if ":" not in job_tag:
+        return "ignored: no tenant-scoped JobTag"
+    tenant_id, document_id = job_tag.split(":", 1)
+    key = {"tenant_id": tenant_id, "document_id": document_id}
 
-    item = table.get_item(Key={"document_id": document_id}).get("Item") or {}
+    item = table.get_item(Key=key).get("Item") or {}
     token = item.get("task_token")
     if not token:
         return "ignored: no pending task"
 
-    # Claim the token before resuming the workflow. A duplicate SNS delivery finds
-    # no token and stops here, so the workflow can only be resumed once. If the
-    # resume call fails after this point, the workflow's own timeout fails it cleanly.
+    # Claim the token before resuming the workflow. A duplicate SNS delivery finds no token and stops here.
+    # If the resume call fails after this point, the workflow's own timeout fails it cleanly.
     try:
         table.update_item(
-            Key={"document_id": document_id},
+            Key=key,
             UpdateExpression="REMOVE task_token",
             ConditionExpression="task_token = :token",
             ExpressionAttributeValues={":token": token},

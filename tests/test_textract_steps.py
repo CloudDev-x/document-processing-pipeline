@@ -15,6 +15,10 @@ import pytest
 from src import steps
 
 
+def ev(action, **extra):
+    return {"action": action, "tenant_id": "acme", "document_id": "doc-1", **extra}
+
+
 def bedrock_reply(text):
     body = MagicMock()
     body.read.return_value = json.dumps(
@@ -48,66 +52,64 @@ class TestClassify:
     )
     def test_routes_by_content_type(self, s3, content_type, route):
         s3.head_object.return_value = {"ContentType": content_type}
-        result = steps.lambda_handler({"action": "classify", "document_id": "doc-1"}, None)
-        assert result["route"] == route
+        assert steps.lambda_handler(ev("classify"), None)["route"] == route
+        s3.head_object.assert_called_once_with(Bucket="test-bucket", Key="acme/doc-1")
 
     def test_ignores_charset_parameter(self, s3):
         s3.head_object.return_value = {"ContentType": "text/plain; charset=utf-8"}
-        result = steps.lambda_handler({"action": "classify", "document_id": "doc-1"}, None)
-        assert result["route"] == "text"
+        assert steps.lambda_handler(ev("classify"), None)["route"] == "text"
 
     def test_unknown_type_is_terminal(self, s3):
         s3.head_object.return_value = {"ContentType": "application/octet-stream"}
         with pytest.raises(steps.TerminalError):
-            steps.lambda_handler({"action": "classify", "document_id": "doc-1"}, None)
+            steps.lambda_handler(ev("classify"), None)
 
 
 class TestStartTextract:
-    def test_saves_token_then_starts_job_with_tag_and_notification(self, table):
-        with patch.object(steps, "textract") as tx, patch.object(steps, "TEXTRACT_TOPIC_ARN", "arn:topic"), patch.object(
-            steps, "TEXTRACT_ROLE_ARN", "arn:role"
-        ):
+    def test_saves_token_then_starts_job_with_tenant_tag(self, table):
+        with patch.object(steps, "textract") as tx, patch.object(
+            steps, "TEXTRACT_TOPIC_ARN", "arn:topic"
+        ), patch.object(steps, "TEXTRACT_ROLE_ARN", "arn:role"):
             tx.start_document_text_detection.return_value = {"JobId": "job-1"}
-            result = steps.lambda_handler(
-                {"action": "start_textract", "document_id": "doc-1", "task_token": "tok-1"}, None
-            )
+            result = steps.lambda_handler(ev("start_textract", task_token="tok-1"), None)
         assert result == {"job_id": "job-1"}
-        assert table.update_item.call_args_list[0].kwargs["ExpressionAttributeValues"][":t"] == "tok-1"
+        first = table.update_item.call_args_list[0].kwargs
+        assert first["Key"] == {"tenant_id": "acme", "document_id": "doc-1"}
+        assert first["ExpressionAttributeValues"][":t"] == "tok-1"
         kwargs = tx.start_document_text_detection.call_args.kwargs
-        assert kwargs["JobTag"] == "doc-1"
+        assert kwargs["JobTag"] == "acme:doc-1"
+        assert kwargs["DocumentLocation"]["S3Object"]["Name"] == "acme/doc-1"
         assert kwargs["NotificationChannel"] == {"SNSTopicArn": "arn:topic", "RoleArn": "arn:role"}
 
     def test_unsafe_document_id_is_rejected(self, table):
         with patch.object(steps, "textract") as tx:
             with pytest.raises(steps.TerminalError):
-                steps.lambda_handler(
-                    {"action": "start_textract", "document_id": "bad key with spaces", "task_token": "t"}, None
-                )
+                steps.lambda_handler(ev("start_textract", document_id="bad id with spaces", task_token="t"), None)
             tx.start_document_text_detection.assert_not_called()
 
 
 class TestReadTextract:
-    def test_stores_text_in_scratch_bucket(self, table, s3):
-        table.get_item.return_value = {"Item": {"document_id": "doc-1", "textract_job_id": "job-1"}}
+    def test_stores_text_under_tenant_scratch_key(self, table, s3):
+        table.get_item.return_value = {"Item": {"tenant_id": "acme", "document_id": "doc-1", "textract_job_id": "job-1"}}
         with patch.object(steps, "get_text_detection", return_value=("SUCCEEDED", "Opening balance 100")), patch.object(
             steps, "SCRATCH_BUCKET_NAME", "scratch-bucket"
         ):
-            result = steps.lambda_handler({"action": "read_textract", "document_id": "doc-1"}, None)
-        assert result == {"text_key": "text/doc-1.txt"}
-        s3.put_object.assert_called_once()
+            result = steps.lambda_handler(ev("read_textract"), None)
+        assert result == {"text_key": "text/acme/doc-1.txt"}
+        table.get_item.assert_called_once_with(Key={"tenant_id": "acme", "document_id": "doc-1"})
         assert s3.put_object.call_args.kwargs["Bucket"] == "scratch-bucket"
 
     def test_failed_job_is_terminal(self, table, s3):
-        table.get_item.return_value = {"Item": {"document_id": "doc-1", "textract_job_id": "job-1"}}
+        table.get_item.return_value = {"Item": {"textract_job_id": "job-1"}}
         with patch.object(steps, "get_text_detection", return_value=("FAILED", "unsupported")):
             with pytest.raises(steps.TerminalError):
-                steps.lambda_handler({"action": "read_textract", "document_id": "doc-1"}, None)
+                steps.lambda_handler(ev("read_textract"), None)
 
     def test_running_job_is_transient(self, table, s3):
-        table.get_item.return_value = {"Item": {"document_id": "doc-1", "textract_job_id": "job-1"}}
+        table.get_item.return_value = {"Item": {"textract_job_id": "job-1"}}
         with patch.object(steps, "get_text_detection", return_value=("IN_PROGRESS", None)):
             with pytest.raises(steps.TransientError):
-                steps.lambda_handler({"action": "read_textract", "document_id": "doc-1"}, None)
+                steps.lambda_handler(ev("read_textract"), None)
 
 
 class TestExtractFromScratch:
@@ -115,7 +117,5 @@ class TestExtractFromScratch:
         s3.get_object.return_value = {"Body": BytesIO(b"Opening balance 100")}
         bedrock.invoke_model.return_value = bedrock_reply('{"document_type":"statement"}')
         with patch.object(steps, "SCRATCH_BUCKET_NAME", "scratch-bucket"):
-            steps.lambda_handler(
-                {"action": "extract", "document_id": "doc-1", "text_key": "text/doc-1.txt"}, None
-            )
-        s3.get_object.assert_called_once_with(Bucket="scratch-bucket", Key="text/doc-1.txt")
+            steps.lambda_handler(ev("extract", text_key="text/acme/doc-1.txt"), None)
+        s3.get_object.assert_called_once_with(Bucket="scratch-bucket", Key="text/acme/doc-1.txt")

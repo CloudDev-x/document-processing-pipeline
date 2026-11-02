@@ -116,6 +116,7 @@ resource "aws_sfn_state_machine" "document" {
           FunctionName = aws_lambda_function.steps.arn
           Payload = {
             action          = "classify"
+            "tenant_id.$"   = "$.tenant_id"
             "document_id.$" = "$.document_id"
           }
         }
@@ -141,6 +142,7 @@ resource "aws_sfn_state_machine" "document" {
           FunctionName = aws_lambda_function.steps.arn
           Payload = {
             action          = "start_textract"
+            "tenant_id.$"   = "$.tenant_id"
             "document_id.$" = "$.document_id"
             "task_token.$"  = "$$.Task.Token"
           }
@@ -163,6 +165,7 @@ resource "aws_sfn_state_machine" "document" {
           FunctionName = aws_lambda_function.steps.arn
           Payload = {
             action          = "read_textract"
+            "tenant_id.$"   = "$.tenant_id"
             "document_id.$" = "$.document_id"
           }
         }
@@ -185,6 +188,7 @@ resource "aws_sfn_state_machine" "document" {
           FunctionName = aws_lambda_function.steps.arn
           Payload = {
             action          = "extract"
+            "tenant_id.$"   = "$.tenant_id"
             "document_id.$" = "$.document_id"
             "text_key.$"    = "$.textract_text.result.text_key"
           }
@@ -208,6 +212,7 @@ resource "aws_sfn_state_machine" "document" {
           FunctionName = aws_lambda_function.steps.arn
           Payload = {
             action          = "extract"
+            "tenant_id.$"   = "$.tenant_id"
             "document_id.$" = "$.document_id"
           }
         }
@@ -246,6 +251,7 @@ resource "aws_sfn_state_machine" "document" {
           FunctionName = aws_lambda_function.steps.arn
           Payload = {
             action          = "persist"
+            "tenant_id.$"   = "$.tenant_id"
             "document_id.$" = "$.document_id"
             "status.$"      = "$.validation.result.status"
             "result.$"      = "$.validation.result.result"
@@ -265,6 +271,7 @@ resource "aws_sfn_state_machine" "document" {
           FunctionName = aws_lambda_function.steps.arn
           Payload = {
             action          = "fail"
+            "tenant_id.$"   = "$.tenant_id"
             "document_id.$" = "$.document_id"
             "error.$"       = "States.JsonToString($.error)"
           }
