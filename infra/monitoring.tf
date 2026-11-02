@@ -90,7 +90,7 @@ resource "aws_cloudwatch_dashboard" "main" {
         width  = 12
         height = 6
         properties = {
-          title   = "Queue Depth"
+          title = "Queue Depth"
           metrics = [
             ["AWS/SQS", "ApproximateNumberOfMessagesVisible", "QueueName", aws_sqs_queue.work.name, { label = "Work queue" }],
             ["AWS/SQS", "ApproximateNumberOfMessagesVisible", "QueueName", aws_sqs_queue.work_dlq.name, { label = "DLQ", color = "#d62728" }],
@@ -108,7 +108,7 @@ resource "aws_cloudwatch_dashboard" "main" {
         width  = 12
         height = 6
         properties = {
-          title   = "Lambda Invocations & Errors"
+          title = "Lambda Invocations & Errors"
           metrics = [
             ["AWS/Lambda", "Invocations", "FunctionName", aws_lambda_function.worker.function_name, { label = "Invocations" }],
             ["AWS/Lambda", "Errors", "FunctionName", aws_lambda_function.worker.function_name, { label = "Errors", color = "#d62728" }],
@@ -126,7 +126,7 @@ resource "aws_cloudwatch_dashboard" "main" {
         width  = 12
         height = 6
         properties = {
-          title   = "Lambda Duration (ms)"
+          title = "Lambda Duration (ms)"
           metrics = [
             ["AWS/Lambda", "Duration", "FunctionName", aws_lambda_function.worker.function_name, { label = "p50", stat = "p50" }],
             ["AWS/Lambda", "Duration", "FunctionName", aws_lambda_function.worker.function_name, { label = "p99", stat = "p99", color = "#ff7f0e" }],
@@ -143,7 +143,7 @@ resource "aws_cloudwatch_dashboard" "main" {
         width  = 12
         height = 6
         properties = {
-          title   = "DynamoDB Write Capacity"
+          title = "DynamoDB Write Capacity"
           metrics = [
             ["AWS/DynamoDB", "ConsumedWriteCapacityUnits", "TableName", aws_dynamodb_table.documents.name, { label = "Consumed WCU" }],
           ]
