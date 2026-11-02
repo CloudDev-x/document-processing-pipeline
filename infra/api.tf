@@ -53,7 +53,7 @@ resource "aws_lambda_function" "api" {
   environment {
     variables = {
       BUCKET_NAME      = aws_s3_bucket.uploads.bucket
-      TABLE_NAME       = aws_dynamodb_table.documents.name
+      TABLE_NAME       = "docpipe-documents"
       TENANT_BY_KEY_ID = jsonencode({ for t, k in aws_api_gateway_api_key.tenant : k.id => t })
     }
   }
@@ -139,6 +139,10 @@ resource "aws_lambda_permission" "api_gateway" {
 }
 
 resource "aws_api_gateway_deployment" "docpipe" {
+  lifecycle {
+    create_before_destroy = true
+  }
+
   rest_api_id = aws_api_gateway_rest_api.docpipe.id
 
   triggers = {
