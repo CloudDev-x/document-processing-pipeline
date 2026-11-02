@@ -6,6 +6,29 @@ A serverless pipeline on AWS. Tenants upload documents through a presigned URL. 
 - Detailed design: [docs/project-overview.md](docs/project-overview.md)
 - Operations: [docs/dlq-runbook.md](docs/dlq-runbook.md)
 
+## The problem
+
+Businesses receive large volumes of documents such as bank statements, IDs, and loan forms. Someone has to read each one, type the key details into a system, and check them. That work is slow, expensive, and error-prone. It also raises security and compliance questions: documents contain personal data, customers must not see each other's files, and an auditor needs to know who changed what and when.
+
+Automating it with AI creates new problems. A model can be confidently wrong, a burst of uploads can overwhelm the services it depends on, and a duplicate message can charge twice or notify a customer twice.
+
+## How this pipeline solves it
+
+| Problem | What the pipeline does |
+|---------|------------------------|
+| Manual data entry is slow and costly | Extracts structured fields with Claude Haiku on Amazon Bedrock |
+| Wrong AI output reaches the record | Confidence below 0.8 waits for a human review, and reviewers can correct fields |
+| Bursts overwhelm downstream services | An SQS queue buffers uploads, and concurrency limits protect Bedrock and Textract quotas |
+| Scanned PDFs and images can't be read directly | Async Textract extracts text, and a Step Functions workflow waits for the job without holding a Lambda open |
+| Duplicate messages double-charge or double-notify | Conditional updates, deterministic execution names, and single-use task tokens make duplicates harmless |
+| Bad files get retried over and over | Invalid input fails on the first attempt, and only infrastructure faults reach the dead-letter queue |
+| One customer can see another's data | Separate API keys, tenant-scoped storage and queries, and per-tenant throttling and quotas |
+| Customers have to poll for results | SNS notifications and HMAC-signed webhooks push each result to the customer's system |
+| Auditors need a history of changes | A DynamoDB stream writes one audit row per status change, and S3 versioning keeps earlier file versions |
+| Uploads can break the pipeline's limits | Presigned POST uploads go straight to S3, which enforces size and content-type limits |
+| Secrets and settings are hard to change safely | Model settings and the webhook secret live in SSM, not in code |
+| Deploys risk breaking production | CI runs tests and checks, then deploys with OIDC, with remote state and locking |
+
 ## Features
 
 - **Multi-tenant:** each tenant has its own API key. Documents are stored under `tenant/<uuid>` in S3 and keyed by `(tenant_id, document_id)` in DynamoDB.
