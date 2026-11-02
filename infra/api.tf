@@ -33,7 +33,7 @@ resource "aws_iam_role_policy" "api" {
       },
       {
         Effect   = "Allow"
-        Action   = ["dynamodb:GetItem", "dynamodb:Query"]
+        Action   = ["dynamodb:GetItem", "dynamodb:Query", "dynamodb:UpdateItem"]
         Resource = aws_dynamodb_table.documents.arn
       },
     ]
@@ -149,6 +149,8 @@ resource "aws_api_gateway_deployment" "docpipe" {
       aws_api_gateway_integration.post_documents.id,
       aws_api_gateway_integration.get_documents.id,
       aws_api_gateway_integration.get_document.id,
+      aws_api_gateway_method.review.id,
+      aws_api_gateway_integration.review.id,
     ]))
   }
 
