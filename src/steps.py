@@ -13,7 +13,27 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 BUCKET_NAME = os.environ["BUCKET_NAME"]
-MODEL_ID = os.environ["MODEL_ID"]
+ssm = boto3.client("ssm")
+_config = None
+CONFIG_PARAMETERS = {
+    "model_id": "/docpipe/model_id",
+    "review_threshold": "/docpipe/review_threshold",
+    "extraction_prompt": "/docpipe/extraction_prompt",
+}
+
+
+def get_config():
+    """Read model settings from SSM once per container. Changes apply to containers that start after the update."""
+    global _config
+    if _config is None:
+        resp = ssm.get_parameters(Names=list(CONFIG_PARAMETERS.values()))
+        values = {p["Name"]: p["Value"] for p in resp["Parameters"]}
+        _config = {
+            "model_id": values[CONFIG_PARAMETERS["model_id"]],
+            "review_threshold": float(values[CONFIG_PARAMETERS["review_threshold"]]),
+            "extraction_prompt": values[CONFIG_PARAMETERS["extraction_prompt"]],
+        }
+    return _config
 SCRATCH_BUCKET_NAME = os.environ.get("SCRATCH_BUCKET_NAME", "")
 TEXTRACT_TOPIC_ARN = os.environ.get("TEXTRACT_TOPIC_ARN", "")
 TEXTRACT_ROLE_ARN = os.environ.get("TEXTRACT_ROLE_ARN", "")
@@ -40,12 +60,6 @@ TEXTRACT_TERMINAL_STATUSES = {"SUCCEEDED", "FAILED", "PARTIAL_SUCCESS"}
 # Textract JobTag rules: letters, digits and a few symbols, up to 64 characters. The tag is tenant:document_id.
 JOB_TAG_PATTERN = re.compile(r"^[A-Za-z0-9_.\-:+=@]{1,64}$")
 
-EXTRACTION_PROMPT = """You classify and extract data from a customer document.
-Return only a JSON object with these keys:
-"document_type": one of "statement", "id", "loan_form", "other"
-"confidence": a number from 0 to 1
-"fields": an object of key fields you can read from the document, with string values
-Do not include any other text."""
 
 
 class TransientError(Exception):
@@ -80,11 +94,11 @@ def call_model(document_text):
     body = {
         "anthropic_version": "bedrock-2023-05-31",
         "max_tokens": 1024,
-        "system": EXTRACTION_PROMPT,
+        "system": get_config()["extraction_prompt"],
         "messages": [{"role": "user", "content": document_text}],
     }
     try:
-        response = bedrock.invoke_model(modelId=MODEL_ID, body=json.dumps(body))
+        response = bedrock.invoke_model(modelId=get_config()["model_id"], body=json.dumps(body))
     except (ReadTimeoutError, ConnectTimeoutError) as err:
         raise TransientError(str(err)) from err
     except ClientError as err:
@@ -141,7 +155,7 @@ def finalize(key, status, result, usage):
         ExpressionAttributeValues={
             ":status": status,
             ":e": json.dumps(result),  # stored as a string to avoid DynamoDB float issues
-            ":m": MODEL_ID,
+            ":m": get_config()["model_id"],
             ":i": usage["input_tokens"],
             ":o": usage["output_tokens"],
             ":now": now_iso(),
@@ -279,7 +293,7 @@ def action_extract(event):
 
 def action_validate(event):
     result = validate_result(parse_model_json(event["raw_reply"]))
-    status = "REVIEW" if result["confidence"] < REVIEW_THRESHOLD else "COMPLETED"
+    status = "REVIEW" if result["confidence"] < get_config()["review_threshold"] else "COMPLETED"
     return {"status": status, "result": result}
 
 
