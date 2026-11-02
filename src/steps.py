@@ -1,6 +1,8 @@
 import json
 import logging
 import os
+import re
+import time
 from datetime import datetime, timezone
 
 import boto3
@@ -12,8 +14,12 @@ logger.setLevel(logging.INFO)
 
 BUCKET_NAME = os.environ["BUCKET_NAME"]
 MODEL_ID = os.environ["MODEL_ID"]
+SCRATCH_BUCKET_NAME = os.environ.get("SCRATCH_BUCKET_NAME", "")
+TEXTRACT_TOPIC_ARN = os.environ.get("TEXTRACT_TOPIC_ARN", "")
+TEXTRACT_ROLE_ARN = os.environ.get("TEXTRACT_ROLE_ARN", "")
 table = boto3.resource("dynamodb").Table(os.environ["TABLE_NAME"])
 s3 = boto3.client("s3")
+textract = boto3.client("textract")
 # One attempt per call. Step Functions owns retries, so each attempt is visible in the workflow history.
 bedrock = boto3.client(
     "bedrock-runtime",
@@ -22,12 +28,17 @@ bedrock = boto3.client(
 
 REVIEW_THRESHOLD = 0.8  # results below this confidence go to a human
 ALLOWED_TYPES = {"statement", "id", "loan_form", "other"}
+TEXT_CONTENT_TYPES = {"text/plain"}
+TEXTRACT_CONTENT_TYPES = {"application/pdf", "image/png", "image/jpeg"}
 TRANSIENT_BEDROCK_ERRORS = {
     "ThrottlingException",
     "ServiceUnavailableException",
     "ModelTimeoutException",
     "InternalServerException",
 }
+TEXTRACT_TERMINAL_STATUSES = {"SUCCEEDED", "FAILED", "PARTIAL_SUCCESS"}
+# Textract JobTag rules: letters, digits and a few symbols, up to 64 characters.
+JOB_TAG_PATTERN = re.compile(r"^[A-Za-z0-9_.\-:+=@]{1,64}$")
 
 EXTRACTION_PROMPT = """You classify and extract data from a customer document.
 Return only a JSON object with these keys:
@@ -49,8 +60,8 @@ def now_iso():
     return datetime.now(timezone.utc).isoformat()
 
 
-def load_document(document_id):
-    obj = s3.get_object(Bucket=BUCKET_NAME, Key=document_id)
+def read_text(bucket, key):
+    obj = s3.get_object(Bucket=bucket, Key=key)
     try:
         return obj["Body"].read().decode("utf-8")
     except UnicodeDecodeError as err:
@@ -139,8 +150,108 @@ def record_failure(document_id, message):
     )
 
 
+def start_text_detection(bucket, key, job_tag=None, topic_arn=None, role_arn=None):
+    kwargs = {"DocumentLocation": {"S3Object": {"Bucket": bucket, "Name": key}}}
+    if job_tag:
+        kwargs["JobTag"] = job_tag
+    if topic_arn and role_arn:
+        kwargs["NotificationChannel"] = {"SNSTopicArn": topic_arn, "RoleArn": role_arn}
+    return textract.start_document_text_detection(**kwargs)["JobId"]
+
+
+def get_text_detection(job_id):
+    """Return (status, text). Text is None until the job reaches a terminal status."""
+    lines = []
+    token = None
+    while True:
+        kwargs = {"JobId": job_id}
+        if token:
+            kwargs["NextToken"] = token
+        resp = textract.get_document_text_detection(**kwargs)
+        status = resp["JobStatus"]
+        if status not in TEXTRACT_TERMINAL_STATUSES:
+            return status, None
+        if status == "FAILED":
+            return status, resp.get("StatusMessage", "Textract job failed")
+        lines.extend(b["Text"] for b in resp.get("Blocks", []) if b["BlockType"] == "LINE")
+        token = resp.get("NextToken")
+        if not token:
+            return status, "\n".join(lines)
+
+
+def wait_for_text(job_id, timeout_seconds=300, poll_seconds=5):
+    """Polling helper for manual testing only. The workflow uses an SNS callback instead."""
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        status, text = get_text_detection(job_id)
+        if status in TEXTRACT_TERMINAL_STATUSES:
+            return status, text
+        if time.monotonic() > deadline:
+            raise TimeoutError(f"Textract job {job_id} still {status} after {timeout_seconds}s")
+        time.sleep(poll_seconds)
+
+
+def action_classify(event):
+    head = s3.head_object(Bucket=BUCKET_NAME, Key=event["document_id"])
+    content_type = head.get("ContentType", "").split(";")[0].strip().lower()
+    if content_type in TEXT_CONTENT_TYPES:
+        route = "text"
+    elif content_type in TEXTRACT_CONTENT_TYPES:
+        route = "textract"
+    else:
+        raise TerminalError(f"unsupported content type: {content_type or 'none'}")
+    return {"route": route, "content_type": content_type}
+
+
+def action_start_textract(event):
+    document_id = event["document_id"]
+    if not JOB_TAG_PATTERN.match(document_id):
+        raise TerminalError("document id cannot be used as a Textract job tag")
+    # Save the task token before starting the job. If the job finished first, the callback would find no token to resume.
+    table.update_item(
+        Key={"document_id": document_id},
+        UpdateExpression="SET task_token = :t, updated_at = :now",
+        ExpressionAttributeValues={":t": event["task_token"], ":now": now_iso()},
+    )
+    job_id = start_text_detection(
+        BUCKET_NAME,
+        document_id,
+        job_tag=document_id,
+        topic_arn=TEXTRACT_TOPIC_ARN,
+        role_arn=TEXTRACT_ROLE_ARN,
+    )
+    table.update_item(
+        Key={"document_id": document_id},
+        UpdateExpression="SET textract_job_id = :j",
+        ExpressionAttributeValues={":j": job_id},
+    )
+    return {"job_id": job_id}
+
+
+def action_read_textract(event):
+    document_id = event["document_id"]
+    item = table.get_item(Key={"document_id": document_id}).get("Item") or {}
+    job_id = item.get("textract_job_id")
+    if not job_id:
+        raise TerminalError("no Textract job recorded for this document")
+    status, text = get_text_detection(job_id)
+    if status not in TEXTRACT_TERMINAL_STATUSES:
+        raise TransientError(f"Textract job still {status}")
+    if status != "SUCCEEDED":
+        raise TerminalError(f"Textract finished with status {status}")
+    if not text or not text.strip():
+        raise TerminalError("Textract found no text in the document")
+    text_key = f"text/{document_id}.txt"
+    s3.put_object(Bucket=SCRATCH_BUCKET_NAME, Key=text_key, Body=text.encode("utf-8"))
+    return {"text_key": text_key}
+
+
 def action_extract(event):
-    return call_model(load_document(event["document_id"]))
+    if event.get("text_key"):
+        text = read_text(SCRATCH_BUCKET_NAME, event["text_key"])
+    else:
+        text = read_text(BUCKET_NAME, event["document_id"])
+    return call_model(text)
 
 
 def action_validate(event):
@@ -160,6 +271,9 @@ def action_fail(event):
 
 
 ACTIONS = {
+    "classify": action_classify,
+    "start_textract": action_start_textract,
+    "read_textract": action_read_textract,
     "extract": action_extract,
     "validate": action_validate,
     "persist": action_persist,

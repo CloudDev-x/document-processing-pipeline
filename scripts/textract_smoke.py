@@ -8,7 +8,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.textract_async import start_text_detection, wait_for_text
+from src.steps import start_text_detection, wait_for_text
 
 bucket, key = sys.argv[1], sys.argv[2]
 job_id = start_text_detection(bucket, key)

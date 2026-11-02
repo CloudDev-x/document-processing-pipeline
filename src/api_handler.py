@@ -8,8 +8,8 @@ import boto3
 BUCKET_NAME = os.environ["BUCKET_NAME"]
 TABLE_NAME = os.environ["TABLE_NAME"]
 UPLOAD_TTL_SECONDS = 300
-MAX_UPLOAD_BYTES = 5 * 1024 * 1024
-ALLOWED_CONTENT_TYPES = {"text/plain"}
+MAX_UPLOAD_BYTES = 10 * 1024 * 1024
+ALLOWED_CONTENT_TYPES = {"text/plain", "application/pdf", "image/png", "image/jpeg"}
 
 s3 = boto3.client("s3")
 table = boto3.resource("dynamodb").Table(TABLE_NAME)

@@ -57,7 +57,7 @@ class TestCreateUpload:
         assert presign.call_args.kwargs["Fields"]["Content-Type"] == "text/plain"
 
     def test_rejects_unsupported_content_type(self, presign):
-        resp = lambda_handler(event("POST", "/documents", body='{"content_type":"application/pdf"}'), None)
+        resp = lambda_handler(event("POST", "/documents", body='{"content_type":"application/zip"}'), None)
         assert resp["statusCode"] == 400
         assert "unsupported content_type" in json.loads(resp["body"])["error"]
         presign.assert_not_called()

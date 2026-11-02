@@ -20,8 +20,21 @@ data "aws_iam_policy_document" "steps" {
     resources = ["${aws_s3_bucket.uploads.arn}/*"]
   }
   statement {
-    actions   = ["dynamodb:UpdateItem"]
+    actions   = ["s3:GetObject", "s3:PutObject"]
+    resources = ["${aws_s3_bucket.textract_scratch.arn}/*"]
+  }
+  statement {
+    actions   = ["dynamodb:GetItem", "dynamodb:UpdateItem"]
     resources = [aws_dynamodb_table.documents.arn]
+  }
+  # Textract actions do not support resource-level permissions.
+  statement {
+    actions   = ["textract:StartDocumentTextDetection", "textract:GetDocumentTextDetection"]
+    resources = ["*"]
+  }
+  statement {
+    actions   = ["iam:PassRole"]
+    resources = [aws_iam_role.textract_sns.arn]
   }
   statement {
     actions = ["bedrock:InvokeModel"]
@@ -50,9 +63,12 @@ resource "aws_lambda_function" "steps" {
 
   environment {
     variables = {
-      TABLE_NAME  = aws_dynamodb_table.documents.name
-      BUCKET_NAME = aws_s3_bucket.uploads.id
-      MODEL_ID    = local.model_id
+      TABLE_NAME          = aws_dynamodb_table.documents.name
+      BUCKET_NAME         = aws_s3_bucket.uploads.id
+      SCRATCH_BUCKET_NAME = aws_s3_bucket.textract_scratch.id
+      MODEL_ID            = local.model_id
+      TEXTRACT_TOPIC_ARN  = aws_sns_topic.textract_done.arn
+      TEXTRACT_ROLE_ARN   = aws_iam_role.textract_sns.arn
     }
   }
 }
@@ -89,10 +105,102 @@ resource "aws_sfn_state_machine" "document" {
   role_arn = aws_iam_role.workflow.arn
 
   definition = jsonencode({
-    Comment        = "Document extraction: model call, validation, persistence"
-    StartAt        = "Extract"
-    TimeoutSeconds = 900
+    Comment        = "Document processing: classify, extract text, model call, validation, persistence"
+    StartAt        = "Classify"
+    TimeoutSeconds = 1800
     States = {
+      Classify = {
+        Type     = "Task"
+        Resource = "arn:aws:states:::lambda:invoke"
+        Parameters = {
+          FunctionName = aws_lambda_function.steps.arn
+          Payload = {
+            action          = "classify"
+            "document_id.$" = "$.document_id"
+          }
+        }
+        ResultSelector = { "result.$" = "$.Payload" }
+        ResultPath     = "$.classification"
+        TimeoutSeconds = 30
+        Catch          = [{ ErrorEquals = ["States.ALL"], ResultPath = "$.error", Next = "MarkFailed" }]
+        Next           = "Route"
+      }
+      Route = {
+        Type = "Choice"
+        Choices = [{
+          Variable     = "$.classification.result.route"
+          StringEquals = "textract"
+          Next         = "StartTextract"
+        }]
+        Default = "Extract"
+      }
+      StartTextract = {
+        Type     = "Task"
+        Resource = "arn:aws:states:::lambda:invoke.waitForTaskToken"
+        Parameters = {
+          FunctionName = aws_lambda_function.steps.arn
+          Payload = {
+            action          = "start_textract"
+            "document_id.$" = "$.document_id"
+            "task_token.$"  = "$$.Task.Token"
+          }
+        }
+        ResultPath     = "$.textract"
+        TimeoutSeconds = 1200
+        Retry = [{
+          ErrorEquals     = ["TransientError"]
+          IntervalSeconds = 5
+          MaxAttempts     = 3
+          BackoffRate     = 2
+        }]
+        Catch = [{ ErrorEquals = ["States.ALL"], ResultPath = "$.error", Next = "MarkFailed" }]
+        Next  = "ReadTextract"
+      }
+      ReadTextract = {
+        Type     = "Task"
+        Resource = "arn:aws:states:::lambda:invoke"
+        Parameters = {
+          FunctionName = aws_lambda_function.steps.arn
+          Payload = {
+            action          = "read_textract"
+            "document_id.$" = "$.document_id"
+          }
+        }
+        ResultSelector = { "result.$" = "$.Payload" }
+        ResultPath     = "$.textract_text"
+        TimeoutSeconds = 60
+        Retry = [{
+          ErrorEquals     = ["TransientError"]
+          IntervalSeconds = 5
+          MaxAttempts     = 3
+          BackoffRate     = 2
+        }]
+        Catch = [{ ErrorEquals = ["States.ALL"], ResultPath = "$.error", Next = "MarkFailed" }]
+        Next  = "ExtractTextract"
+      }
+      ExtractTextract = {
+        Type     = "Task"
+        Resource = "arn:aws:states:::lambda:invoke"
+        Parameters = {
+          FunctionName = aws_lambda_function.steps.arn
+          Payload = {
+            action          = "extract"
+            "document_id.$" = "$.document_id"
+            "text_key.$"    = "$.textract_text.result.text_key"
+          }
+        }
+        ResultSelector = { "result.$" = "$.Payload" }
+        ResultPath     = "$.extraction"
+        TimeoutSeconds = 90
+        Retry = [{
+          ErrorEquals     = ["TransientError"]
+          IntervalSeconds = 5
+          MaxAttempts     = 3
+          BackoffRate     = 2
+        }]
+        Catch = [{ ErrorEquals = ["States.ALL"], ResultPath = "$.error", Next = "MarkFailed" }]
+        Next  = "Validate"
+      }
       Extract = {
         Type     = "Task"
         Resource = "arn:aws:states:::lambda:invoke"
@@ -170,7 +278,7 @@ resource "aws_sfn_state_machine" "document" {
       Failed = {
         Type  = "Fail"
         Error = "DocumentFailed"
-        Cause = "Extraction failed. See last_error in the documents table."
+        Cause = "Document processing failed. See last_error in the documents table."
       }
     }
   })

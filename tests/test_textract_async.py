@@ -7,7 +7,7 @@ os.environ.setdefault("AWS_DEFAULT_REGION", "us-east-1")
 
 import pytest
 
-from src import textract_async
+from src import steps as textract_async
 
 
 @pytest.fixture
