@@ -265,8 +265,22 @@ def action_persist(event):
     return {"status": event["status"]}
 
 
+def describe_error(raw):
+    """Step Functions passes the caught error as a JSON string. Pull out the readable message."""
+    try:
+        outer = json.loads(raw)
+        cause = outer.get("Cause", "")
+        try:
+            cause = json.loads(cause).get("errorMessage", cause)
+        except (ValueError, AttributeError):
+            pass
+        return f"{outer.get('Error', 'Error')}: {cause}"
+    except (ValueError, TypeError, AttributeError):
+        return str(raw)
+
+
 def action_fail(event):
-    record_failure(event["document_id"], str(event.get("error", "unknown error")))
+    record_failure(event["document_id"], describe_error(event.get("error", "unknown error")))
     return {"status": "FAILED"}
 
 
