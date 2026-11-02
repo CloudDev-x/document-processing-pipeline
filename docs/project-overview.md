@@ -52,7 +52,7 @@ See [architecture.md](architecture.md) for the diagram.
 
 ## Known limitations
 
-- The deploy role has `AdministratorAccess`. A scoped policy is the next step.
+- The deploy role uses the project-scoped `docpipe-deploy` policy, limited to `docpipe-*` resources.
 - API keys, not Cognito, authenticate clients.
 - Multi-page PDFs with partial OCR success are rejected rather than sent to review.
 - The Lambda code hash differs between machines, so a local `terraform plan` always shows one in-place update on the worker. CI is the source of truth.

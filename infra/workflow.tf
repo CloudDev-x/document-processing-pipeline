@@ -66,7 +66,6 @@ resource "aws_lambda_function" "steps" {
       TABLE_NAME          = aws_dynamodb_table.documents.name
       BUCKET_NAME         = aws_s3_bucket.uploads.id
       SCRATCH_BUCKET_NAME = aws_s3_bucket.textract_scratch.id
-      MODEL_ID            = local.model_id
       TEXTRACT_TOPIC_ARN  = aws_sns_topic.textract_done.arn
       TEXTRACT_ROLE_ARN   = aws_iam_role.textract_sns.arn
     }
