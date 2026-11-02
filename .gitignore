@@ -18,3 +18,5 @@ venv/
 # OS
 .DS_Store
 infra/build/
+infra/upload_*.py
+infra/statement-api-001.txt

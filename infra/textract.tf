@@ -20,6 +20,7 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "textract_scratch"
   }
 }
 
+# Scratch space for extracted text. Nothing here outlives a day.
 resource "aws_s3_bucket_lifecycle_configuration" "textract_scratch" {
   bucket = aws_s3_bucket.textract_scratch.id
 
@@ -33,24 +34,4 @@ resource "aws_s3_bucket_lifecycle_configuration" "textract_scratch" {
       days = 1
     }
   }
-}
-
-resource "aws_iam_role_policy" "worker_textract" {
-  name = "docpipe-worker-textract"
-  role = aws_iam_role.worker.id
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Effect   = "Allow"
-        Action   = ["textract:StartDocumentTextDetection", "textract:GetDocumentTextDetection"]
-        Resource = "*"
-      },
-      {
-        Effect   = "Allow"
-        Action   = ["s3:GetObject"]
-        Resource = "${aws_s3_bucket.textract_scratch.arn}/*"
-      },
-    ]
-  })
 }

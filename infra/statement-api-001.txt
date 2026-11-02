@@ -1,6 +1,0 @@
-Account Statement
-Account holder: Ada Okafor
-Account number: 0123456789
-Statement period: 2026-10-01 to 2026-10-31
-Opening balance: NGN 250,000.00
-Closing balance: NGN 312,450.75

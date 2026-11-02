@@ -272,13 +272,27 @@ resource "aws_sfn_state_machine" "document" {
         ResultSelector = { "result.$" = "$.Payload" }
         ResultPath     = "$.failure"
         TimeoutSeconds = 30
-        Next           = "Failed"
+        Next           = "FailureKind"
       }
-      Succeed = { Type = "Succeed" }
+      # Bad input and rejected documents are handled outcomes, so the execution succeeds.
+      # Anything else is unexpected and fails the execution, which triggers the alarm.
+      FailureKind = {
+        Type = "Choice"
+        Choices = [{
+          Or = [
+            { Variable = "$.error.Error", StringEquals = "TerminalError" },
+            { Variable = "$.error.Error", StringEquals = "TextractJobFailed" },
+          ]
+          Next = "DocumentRejected"
+        }]
+        Default = "Failed"
+      }
+      DocumentRejected = { Type = "Succeed" }
+      Succeed          = { Type = "Succeed" }
       Failed = {
         Type  = "Fail"
-        Error = "DocumentFailed"
-        Cause = "Document processing failed. See last_error in the documents table."
+        Error = "UnexpectedFailure"
+        Cause = "Unexpected failure in document processing. See the workflow history and last_error."
       }
     }
   })

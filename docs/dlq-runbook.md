@@ -1,55 +1,61 @@
-# Dead-Letter Queue Runbook
+# Dead-letter queue and workflow runbook
 
-## When to use
+## What reaches what
 
-The `docpipe-dlq-depth` CloudWatch alarm fires when ≥1 message is in `docpipe-work-dlq`.
+- **Work queue to DLQ:** only messages the starter Lambda fails to process three times. That means a starter bug or an AWS dependency (DynamoDB, Step Functions) being down. Bad documents never reach the DLQ.
+- **Bad documents:** the workflow marks them `FAILED` with `last_error` and finishes successfully (`DocumentRejected`). Examples: non-UTF-8 text, unsupported content type, invalid model output, a Textract job that failed on the file.
+- **Unexpected workflow failures:** the execution ends in `Failed` and the `docpipe-workflow-failed` alarm fires.
+- **Stuck jobs:** a Textract job that never finishes times out after 20 minutes and fires `docpipe-workflow-timed-out`.
 
-## Triage steps
+## DLQ alarm (`docpipe-dlq-depth`)
 
-1. **Check DLQ depth**
+1. Check depth and peek at a message:
    ```bash
    DLQ_URL=$(aws sqs get-queue-url --queue-name docpipe-work-dlq --query QueueUrl --output text)
    aws sqs get-queue-attributes --queue-url "$DLQ_URL" --attribute-names ApproximateNumberOfMessages
+   aws sqs receive-message --queue-url "$DLQ_URL" --max-number-of-messages 1 --visibility-timeout 0
    ```
-
-2. **Peek at messages** (does not consume them)
-   ```bash
-   aws sqs receive-message --queue-url "$DLQ_URL" --max-number-of-messages 5 --visibility-timeout 0
-   ```
-
-3. **Check the document status in DynamoDB**
-   ```bash
-   aws dynamodb get-item --table-name docpipe-documents --key '{"document_id":{"S":"<DOCUMENT_ID>"}}'
-   ```
-
-4. **Check Lambda logs for the failure**
+2. Read the starter's errors for that document:
    ```bash
    aws logs tail /aws/lambda/docpipe-worker --since 1h --filter-pattern "<DOCUMENT_ID>"
    ```
+3. Fix the cause, then redrive the messages back to the work queue:
+   ```bash
+   aws sqs start-message-move-task \
+     --source-arn arn:aws:sqs:us-east-1:746491202337:docpipe-work-dlq \
+     --destination-arn arn:aws:sqs:us-east-1:746491202337:docpipe-work
+   ```
+4. Purge only after investigation:
+   ```bash
+   aws sqs purge-queue --queue-url "$DLQ_URL"
+   ```
 
-## Common failure modes
+## Workflow failed alarm (`docpipe-workflow-failed`)
 
-| Symptom | Cause | Fix |
-|---------|-------|-----|
-| `last_error: "Only UTF-8 text documents are supported"` | Binary or non-UTF-8 file uploaded | Delete file from S3; purge DLQ message |
-| `last_error` mentions `AccessDeniedException` | IAM permissions or Bedrock access | Check Lambda role policy and model access |
-| `last_error` mentions `ReadTimeoutError` | Bedrock latency spike | Retry by redriving the message; if persistent, increase `read_timeout` |
-| `status: PROCESSING`, `attempts >= 3` | Claim guard was bypassed (duplicate delivery) | Fixed in claim() — should not recur; manually set status to FAILED |
+1. Find the failed executions:
+   ```bash
+   SM_ARN=$(aws stepfunctions list-state-machines --query "stateMachines[?name=='docpipe-document'].stateMachineArn" --output text)
+   aws stepfunctions list-executions --state-machine-arn "$SM_ARN" --status-filter FAILED --max-results 5
+   ```
+2. Read the history for the failing step:
+   ```bash
+   aws stepfunctions get-execution-history --execution-arn "<EXECUTION_ARN>" --reverse-order --max-results 5
+   ```
+3. Check the document record for `last_error` and `status`.
 
-## Redrive
+## Common causes
 
-To reprocess DLQ messages (sends them back to the work queue):
+| Symptom | Likely cause | Fix |
+|---------|--------------|-----|
+| Starter errors with `AccessDeniedException` | Worker role missing a permission | Check `infra/lambda.tf` (`docpipe-worker` policy) |
+| Workflow `Failed`, error from `ReadTextract` or `StartTextract` with `AccessDenied` | Steps role missing a Textract or `iam:PassRole` permission | Check `infra/workflow.tf` (`docpipe-steps` policy) |
+| Workflow `Failed`, error from `ExtractTextract` or `Extract` with `AccessDenied` | Bedrock access or model ID changed | Check model access and `MODEL_ID` in `infra/lambda.tf` |
+| Document stuck at `PROCESSING` | Textract completion never reached the callback | Check the `docpipe-textract-callback` logs and the SNS topic |
+| `docpipe-workflow-timed-out` alarm | Textract job never finished | Check the job in the Textract console using `textract_job_id` on the document |
+| Document `FAILED` with `Only UTF-8 text documents...` | Binary file uploaded as `text/plain` | Expected. Tell the uploader. |
 
-```bash
-aws sqs start-message-move-task \
-  --source-arn arn:aws:sqs:us-east-1:746491202337:docpipe-work-dlq \
-  --destination-arn arn:aws:sqs:us-east-1:746491202337:docpipe-work
-```
+## Notes on retries
 
-## Purge
-
-To discard all DLQ messages after investigation:
-
-```bash
-aws sqs purge-queue --queue-url "$DLQ_URL"
-```
+- Transient Bedrock and Textract errors retry inside the workflow with backoff (3 attempts).
+- Bad input is never retried. It fails on the first attempt.
+- The `attempts` counter on the document counts starter invocations, not workflow retries.
