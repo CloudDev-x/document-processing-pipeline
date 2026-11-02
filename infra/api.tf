@@ -152,9 +152,6 @@ resource "aws_api_gateway_deployment" "docpipe" {
     ]))
   }
 
-  lifecycle {
-    create_before_destroy = true
-  }
 }
 
 resource "aws_api_gateway_stage" "v1" {
