@@ -13,7 +13,7 @@ from unittest.mock import patch, MagicMock
 
 # Patch boto3 clients before importing handler
 with patch("boto3.resource"), patch("boto3.client"):
-    from src.handler import parse_model_json, validate_result, ALLOWED_TYPES, REVIEW_THRESHOLD
+    from src.steps import parse_model_json, validate_result, ALLOWED_TYPES, REVIEW_THRESHOLD
 
 
 class TestParseModelJson:
